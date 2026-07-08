@@ -64,8 +64,14 @@ function readCreds() {
 // Coerce any NetSuite value (incl. { value, text } list fields and arrays) to text.
 function toText(v) {
   if (v == null) return null;
+  // NetSuite returns list / multi-select fields as arrays of { value, text }.
+  // Flatten them to their display text (joined) so columns read cleanly.
+  if (Array.isArray(v)) {
+    const parts = v.map(toText).filter((x) => x != null && x !== '');
+    return parts.length ? parts.join(', ') : null;
+  }
   if (typeof v === 'object') {
-    if (!Array.isArray(v) && ('text' in v || 'value' in v)) {
+    if ('text' in v || 'value' in v) {
       return v.text != null ? String(v.text) : (v.value != null ? String(v.value) : null);
     }
     return JSON.stringify(v);
