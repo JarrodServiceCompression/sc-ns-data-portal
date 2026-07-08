@@ -1,0 +1,32 @@
+# --- Secrets & environment (NEVER commit) ---
+.env
+.env.*
+*.env
+local.settings.json
+*.publishsettings
+*.pfx
+*.pem
+*.key
+secrets.json
+appsettings.*.json
+.azure/
+
+# --- Node / build ---
+node_modules/
+dist/
+build/
+.vite/
+*.local
+
+# --- Logs / OS / editor ---
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Data (fleet data lives in Azure SQL, never here) ---
+*.csv
+*.xlsx
+data/
