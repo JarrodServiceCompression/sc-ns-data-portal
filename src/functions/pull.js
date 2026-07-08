@@ -19,8 +19,6 @@ const RESERVED = new Set(['row_id', 'loaded_at', 'raw_payload']);
 
 // ---------------------------------------------------------------------------
 // OAuth 1.0a Token-Based Auth, HMAC-SHA256 (reused from the Nexus ops portal).
-// HMAC-SHA256 hardcoded on purpose; the JSON body is NOT folded into the
-// signature base string; realm is the NetSuite account id.
 // ---------------------------------------------------------------------------
 function rfc3986(str) {
   return encodeURIComponent(str).replace(/[!*'()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
@@ -63,14 +61,32 @@ function readCreds() {
   };
 }
 
-// NetSuite list-typed fields come back as { value, text }. Coerce anything to text.
+// Coerce any NetSuite value (incl. { value, text } list fields and arrays) to text.
 function toText(v) {
   if (v == null) return null;
   if (typeof v === 'object') {
-    if ('text' in v || 'value' in v) return v.text != null ? String(v.text) : (v.value != null ? String(v.value) : null);
+    if (!Array.isArray(v) && ('text' in v || 'value' in v)) {
+      return v.text != null ? String(v.text) : (v.value != null ? String(v.value) : null);
+    }
     return JSON.stringify(v);
   }
   return String(v);
+}
+
+// NetSuite saved-search rows serialize as { id, recordType, values: { field: ... } }.
+// Flatten so every field in `values` becomes a top-level column, alongside id/recordType.
+function flattenRow(row) {
+  const out = {};
+  if (row && typeof row === 'object') {
+    for (const [k, v] of Object.entries(row)) {
+      if (k === 'values' && v && typeof v === 'object' && !Array.isArray(v)) {
+        for (const [vk, vv] of Object.entries(v)) out[vk] = vv;
+      } else {
+        out[k] = v;
+      }
+    }
+  }
+  return out;
 }
 
 // Sanitize a NetSuite field key into a safe, stable SQL column name.
@@ -97,6 +113,7 @@ async function runSavedSearch(searchID, creds, log) {
     : Array.isArray(data.results) ? data.results
     : Array.isArray(data.data) ? data.data : [];
   log(`RESTlet returned ${rows.length} rows for search ${searchID}`);
+  if (rows.length) log(`Sample raw row: ${JSON.stringify(rows[0]).slice(0, 900)}`);
   return rows;
 }
 
@@ -111,17 +128,14 @@ async function sqlConnect() {
   });
 }
 
-// Ensure the target table has a column for every field key seen in the rows.
-async function ensureColumns(pool, tableName, colMap, log) {
+async function ensureColumns(pool, tableName, cols, log) {
   const existing = new Set();
   const res = await pool.request().query(
     `SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.${tableName}')`);
   for (const r of res.recordset) existing.add(r.name.toLowerCase());
-
   let added = 0;
-  for (const col of colMap.keys()) {
+  for (const col of cols) {
     if (existing.has(col) || RESERVED.has(col)) continue;
-    // Column names are sanitized to [a-z0-9_]; safe to inline. Values are always parameterized.
     await pool.request().query(`ALTER TABLE dbo.${tableName} ADD [${col}] NVARCHAR(MAX) NULL`);
     added++;
   }
@@ -131,32 +145,32 @@ async function ensureColumns(pool, tableName, colMap, log) {
 async function landRows(pool, tableName, rows, log) {
   if (!rows.length) return 0;
 
-  // 1) Build the full set of columns across every row (search may vary row-to-row).
-  const colMap = new Map(); // sanitized column -> original key (first seen wins)
-  for (const row of rows) {
-    for (const key of Object.keys(row)) {
+  // Flatten every row, then build the union of all field columns.
+  const flat = rows.map(flattenRow);
+  const colMap = new Map(); // sanitized column -> original key
+  for (const rec of flat) {
+    for (const key of Object.keys(rec)) {
       const col = colName(key);
       if (!RESERVED.has(col) && !colMap.has(col)) colMap.set(col, key);
     }
   }
-
-  // 2) Make sure every column exists on the table (auto-provision).
-  await ensureColumns(pool, tableName, colMap, log);
-
-  // 3) Insert each row with ALL of its fields + the full raw payload.
   const cols = [...colMap.keys()];
+  await ensureColumns(pool, tableName, cols, log);
+  log(`Loading ${cols.length} data columns: ${cols.slice(0, 40).join(', ')}${cols.length > 40 ? ', …' : ''}`);
+
   let inserted = 0;
-  for (const row of rows) {
+  for (let i = 0; i < flat.length; i++) {
+    const rec = flat[i];
     const req = pool.request();
     const colList = [];
     const valList = [];
-    cols.forEach((col, i) => {
-      const p = `p${i}`;
-      req.input(p, sql.NVarChar(sql.MAX), toText(row[colMap.get(col)]));
+    cols.forEach((col, j) => {
+      const p = `p${j}`;
+      req.input(p, sql.NVarChar(sql.MAX), toText(rec[colMap.get(col)]));
       colList.push(`[${col}]`);
       valList.push(`@${p}`);
     });
-    req.input('raw_payload', sql.NVarChar(sql.MAX), JSON.stringify(row));
+    req.input('raw_payload', sql.NVarChar(sql.MAX), JSON.stringify(rows[i]));
     colList.push('[raw_payload]');
     valList.push('@raw_payload');
     await req.query(`INSERT INTO dbo.${tableName} (${colList.join(',')}) VALUES (${valList.join(',')})`);
@@ -183,7 +197,6 @@ async function runPull(log) {
   return summary;
 }
 
-// HTTP trigger — invoke on demand (portal Test/Run or a GET to the function URL).
 app.http('pull', {
   methods: ['GET', 'POST'],
   authLevel: 'function',
@@ -199,7 +212,6 @@ app.http('pull', {
   },
 });
 
-// Timer trigger — daily unattended refresh at 06:00 UTC. "Claude built it; Azure runs it."
 app.timer('dailyPull', {
   schedule: '0 0 6 * * *',
   handler: async (myTimer, context) => {
