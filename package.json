@@ -1,0 +1,15 @@
+{
+  "name": "sc-ns-data-portal-ingestion",
+  "version": "1.0.0",
+  "description": "NetSuite saved-search pull -> Azure SQL (snapshot-append). Reuses the Nexus OAuth 1.0a TBA + RESTlet pattern.",
+  "main": "src/functions/*.js",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "func start"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.5.0",
+    "@azure/identity": "^4.4.1",
+    "mssql": "^11.0.1"
+  }
+}
