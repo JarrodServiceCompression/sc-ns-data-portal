@@ -7,7 +7,6 @@ const { DefaultAzureCredential } = require('@azure/identity');
 
 // ---------------------------------------------------------------------------
 // Config-driven ingestion: adding a source is a one-line change.
-// Start with the asset saved search; others are commented out.
 // ---------------------------------------------------------------------------
 const SEARCHES = [
   { searchID: process.env.NETSUITE_ASSET_SEARCH_ID, tableName: 'assets' },
@@ -15,11 +14,13 @@ const SEARCHES = [
   // { searchID: 'customsearch214761', tableName: 'weekly_set' },   // Weekly Set
 ];
 
+// Columns the loader manages itself — never treated as data fields.
+const RESERVED = new Set(['row_id', 'loaded_at', 'raw_payload']);
+
 // ---------------------------------------------------------------------------
-// OAuth 1.0a Token-Based Auth, HMAC-SHA256 (reused verbatim in spirit from the
-// Nexus ops portal: netsuite.js). HMAC-SHA256 is hardcoded on purpose. The JSON
-// body is intentionally NOT folded into the signature base string; realm is the
-// NetSuite account id, spliced into the Authorization header manually.
+// OAuth 1.0a Token-Based Auth, HMAC-SHA256 (reused from the Nexus ops portal).
+// HMAC-SHA256 hardcoded on purpose; the JSON body is NOT folded into the
+// signature base string; realm is the NetSuite account id.
 // ---------------------------------------------------------------------------
 function rfc3986(str) {
   return encodeURIComponent(str).replace(/[!*'()]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
@@ -34,36 +35,22 @@ function buildAuthHeader(method, urlStr, creds) {
     oauth_token: creds.tokenId,
     oauth_version: '1.0',
   };
-
-  // Query-string params (script, deploy, ...) MUST be part of the signature base.
   const u = new URL(urlStr);
   const sigParams = { ...oauth };
   for (const [k, v] of u.searchParams) sigParams[k] = v;
-
-  const normalized = Object.keys(sigParams)
-    .sort()
-    .map((k) => `${rfc3986(k)}=${rfc3986(sigParams[k])}`)
-    .join('&');
-
+  const normalized = Object.keys(sigParams).sort()
+    .map((k) => `${rfc3986(k)}=${rfc3986(sigParams[k])}`).join('&');
   const baseUrl = `${u.origin}${u.pathname}`;
   const baseString = [method.toUpperCase(), rfc3986(baseUrl), rfc3986(normalized)].join('&');
   const signingKey = `${rfc3986(creds.consumerSecret)}&${rfc3986(creds.tokenSecret)}`;
   oauth.oauth_signature = crypto.createHmac('sha256', signingKey).update(baseString).digest('base64');
-
-  const header =
-    `OAuth realm="${creds.accountId}", ` +
-    Object.keys(oauth)
-      .sort()
-      .map((k) => `${rfc3986(k)}="${rfc3986(oauth[k])}"`)
-      .join(', ');
-  return header;
+  return `OAuth realm="${creds.accountId}", ` +
+    Object.keys(oauth).sort().map((k) => `${rfc3986(k)}="${rfc3986(oauth[k])}"`).join(', ');
 }
 
 function readCreds() {
-  const required = [
-    'NETSUITE_ACCOUNT_ID', 'NETSUITE_CONSUMER_KEY', 'NETSUITE_CONSUMER_SECRET',
-    'NETSUITE_TOKEN_ID', 'NETSUITE_TOKEN_SECRET', 'NETSUITE_RESTLET_URL',
-  ];
+  const required = ['NETSUITE_ACCOUNT_ID', 'NETSUITE_CONSUMER_KEY', 'NETSUITE_CONSUMER_SECRET',
+    'NETSUITE_TOKEN_ID', 'NETSUITE_TOKEN_SECRET', 'NETSUITE_RESTLET_URL'];
   const missing = required.filter((k) => !process.env[k]);
   if (missing.length) throw new Error(`Missing NetSuite settings: ${missing.join(', ')}`);
   return {
@@ -76,29 +63,28 @@ function readCreds() {
   };
 }
 
-// NetSuite list-typed fields come back as { value, text }. Coerce to plain text.
-function coerce(v) {
-  if (v && typeof v === 'object' && ('text' in v || 'value' in v)) {
-    return v.text != null ? v.text : v.value;
+// NetSuite list-typed fields come back as { value, text }. Coerce anything to text.
+function toText(v) {
+  if (v == null) return null;
+  if (typeof v === 'object') {
+    if ('text' in v || 'value' in v) return v.text != null ? String(v.text) : (v.value != null ? String(v.value) : null);
+    return JSON.stringify(v);
   }
-  return v;
+  return String(v);
 }
 
-// Pick the first present key (case-insensitive-ish) from a row.
-function pick(row, keys) {
-  for (const k of keys) {
-    if (row[k] != null && row[k] !== '') return coerce(row[k]);
-    const found = Object.keys(row).find((rk) => rk.toLowerCase() === k.toLowerCase());
-    if (found && row[found] != null && row[found] !== '') return coerce(row[found]);
-  }
-  return null;
+// Sanitize a NetSuite field key into a safe, stable SQL column name.
+function colName(key) {
+  let c = String(key).replace(/[^A-Za-z0-9_]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '').slice(0, 120);
+  if (!c) c = 'col';
+  if (/^[0-9]/.test(c)) c = 'c_' + c;
+  return c.toLowerCase();
 }
 
 async function runSavedSearch(searchID, creds, log) {
-  const method = 'POST';
-  const authHeader = buildAuthHeader(method, creds.restletUrl, creds);
+  const authHeader = buildAuthHeader('POST', creds.restletUrl, creds);
   const res = await fetch(creds.restletUrl, {
-    method,
+    method: 'POST',
     headers: { Authorization: authHeader, 'Content-Type': 'application/json' },
     body: JSON.stringify({ searchID }),
   });
@@ -109,55 +95,74 @@ async function runSavedSearch(searchID, creds, log) {
   const rows = Array.isArray(data) ? data
     : Array.isArray(data.rows) ? data.rows
     : Array.isArray(data.results) ? data.results
-    : Array.isArray(data.data) ? data.data
-    : [];
+    : Array.isArray(data.data) ? data.data : [];
   log(`RESTlet returned ${rows.length} rows for search ${searchID}`);
   return rows;
 }
 
 async function sqlConnect() {
-  // Managed-identity auth to Azure SQL (no password anywhere).
   const cred = new DefaultAzureCredential();
   const token = await cred.getToken('https://database.windows.net/.default');
   return sql.connect({
-    server: process.env.SQL_SERVER,          // e.g. sql-sc-nsportal.database.windows.net
-    database: process.env.SQL_DATABASE,      // scnsdata
+    server: process.env.SQL_SERVER,
+    database: process.env.SQL_DATABASE,
     options: { encrypt: true },
-    authentication: {
-      type: 'azure-active-directory-access-token',
-      options: { token: token.token },
-    },
+    authentication: { type: 'azure-active-directory-access-token', options: { token: token.token } },
   });
 }
 
-async function landRows(pool, tableName, rows, log) {
-  if (tableName !== 'assets') {
-    // Only the assets table is modeled so far; extend here as searches are added.
-    log(`No table mapping for ${tableName}; skipping insert.`);
-    return 0;
+// Ensure the target table has a column for every field key seen in the rows.
+async function ensureColumns(pool, tableName, colMap, log) {
+  const existing = new Set();
+  const res = await pool.request().query(
+    `SELECT c.name FROM sys.columns c WHERE c.object_id = OBJECT_ID('dbo.${tableName}')`);
+  for (const r of res.recordset) existing.add(r.name.toLowerCase());
+
+  let added = 0;
+  for (const col of colMap.keys()) {
+    if (existing.has(col) || RESERVED.has(col)) continue;
+    // Column names are sanitized to [a-z0-9_]; safe to inline. Values are always parameterized.
+    await pool.request().query(`ALTER TABLE dbo.${tableName} ADD [${col}] NVARCHAR(MAX) NULL`);
+    added++;
   }
+  if (added) log(`Added ${added} new column(s) to dbo.${tableName} for the full field set.`);
+}
+
+async function landRows(pool, tableName, rows, log) {
+  if (!rows.length) return 0;
+
+  // 1) Build the full set of columns across every row (search may vary row-to-row).
+  const colMap = new Map(); // sanitized column -> original key (first seen wins)
+  for (const row of rows) {
+    for (const key of Object.keys(row)) {
+      const col = colName(key);
+      if (!RESERVED.has(col) && !colMap.has(col)) colMap.set(col, key);
+    }
+  }
+
+  // 2) Make sure every column exists on the table (auto-provision).
+  await ensureColumns(pool, tableName, colMap, log);
+
+  // 3) Insert each row with ALL of its fields + the full raw payload.
+  const cols = [...colMap.keys()];
   let inserted = 0;
   for (const row of rows) {
     const req = pool.request();
-    req.input('unit_name', sql.NVarChar(64), pick(row, ['name', 'unit', 'unitNumber', 'assetName', 'custrecord_asset_number']));
-    req.input('status', sql.NVarChar(128), pick(row, ['status', 'unitStatus', 'fleetStatus', 'custrecord5']));
-    req.input('region', sql.NVarChar(128), pick(row, ['region', 'basin', 'area', 'location']));
-    req.input('customer', sql.NVarChar(256), pick(row, ['customer', 'entity', 'company', 'customerName']));
-    req.input('engine_make', sql.NVarChar(128), pick(row, ['engineMake', 'engine_make', 'make']));
-    req.input('engine_model', sql.NVarChar(128), pick(row, ['engineModel', 'engine_model', 'model']));
-    req.input('horsepower', sql.NVarChar(64), pick(row, ['horsepower', 'hp', 'engineHp']));
-    req.input('driver_type', sql.NVarChar(64), pick(row, ['driverType', 'driver_type', 'driver']));
-    req.input('pm_cycle_days', sql.NVarChar(32), pick(row, ['pmCycle', 'pmCycleDays', 'pm_cycle_days']));
+    const colList = [];
+    const valList = [];
+    cols.forEach((col, i) => {
+      const p = `p${i}`;
+      req.input(p, sql.NVarChar(sql.MAX), toText(row[colMap.get(col)]));
+      colList.push(`[${col}]`);
+      valList.push(`@${p}`);
+    });
     req.input('raw_payload', sql.NVarChar(sql.MAX), JSON.stringify(row));
-    await req.query(`
-      INSERT INTO dbo.assets
-        (unit_name, status, region, customer, engine_make, engine_model, horsepower, driver_type, pm_cycle_days, raw_payload)
-      VALUES
-        (@unit_name, @status, @region, @customer, @engine_make, @engine_model, @horsepower, @driver_type, @pm_cycle_days, @raw_payload)
-    `);
+    colList.push('[raw_payload]');
+    valList.push('@raw_payload');
+    await req.query(`INSERT INTO dbo.${tableName} (${colList.join(',')}) VALUES (${valList.join(',')})`);
     inserted++;
   }
-  log(`Inserted ${inserted} rows into dbo.${tableName} (stamped loaded_at).`);
+  log(`Inserted ${inserted} rows into dbo.${tableName} across ${cols.length} data columns (stamped loaded_at).`);
   return inserted;
 }
 
