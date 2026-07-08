@@ -1,0 +1,37 @@
+name: Deploy Ingestion Function
+
+# Manual dispatch until the OIDC deploy credentials are wired via the Function App's
+# Deployment Center (that step injects AZURE_CLIENT_ID / TENANT / SUBSCRIPTION and the
+# federated credential). Kept as workflow_dispatch so it never fails on a bare push.
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --omit=dev
+
+      - name: Azure login (OIDC — no stored secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure Functions
+        uses: Azure/functions-action@v1
+        with:
+          app-name: func-sc-nsportal
+          package: .
