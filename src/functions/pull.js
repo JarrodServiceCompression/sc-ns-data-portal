@@ -123,15 +123,31 @@ async function runSavedSearch(searchID, creds, log) {
   return rows;
 }
 
-async function sqlConnect() {
-  const cred = new DefaultAzureCredential();
-  const token = await cred.getToken('https://database.windows.net/.default');
-  return sql.connect({
-    server: process.env.SQL_SERVER,
-    database: process.env.SQL_DATABASE,
-    options: { encrypt: true },
-    authentication: { type: 'azure-active-directory-access-token', options: { token: token.token } },
-  });
+// Connect with retry. A paused/resuming serverless DB (or any transient network
+// blip) fails the first attempt; resume takes ~30-60s, so we back off and retry
+// rather than dying at the default 15s connect timeout. Connecting is read-only,
+// so retrying here can never create duplicate rows.
+async function sqlConnect(log, attempts = 6, delayMs = 20000) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const cred = new DefaultAzureCredential();
+      const token = await cred.getToken('https://database.windows.net/.default');
+      return await sql.connect({
+        server: process.env.SQL_SERVER,
+        database: process.env.SQL_DATABASE,
+        options: { encrypt: true },
+        connectionTimeout: 30000,
+        requestTimeout: 120000,
+        authentication: { type: 'azure-active-directory-access-token', options: { token: token.token } },
+      });
+    } catch (err) {
+      lastErr = err;
+      log(`SQL connect attempt ${i}/${attempts} failed: ${String(err && err.message || err)}`);
+      if (i < attempts) await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  throw lastErr;
 }
 
 async function ensureColumns(pool, tableName, cols, log) {
@@ -164,32 +180,65 @@ async function landRows(pool, tableName, rows, log) {
   await ensureColumns(pool, tableName, cols, log);
   log(`Loading ${cols.length} data columns: ${cols.slice(0, 40).join(', ')}${cols.length > 40 ? ', …' : ''}`);
 
+  // One snapshot = one transaction = one loaded_at stamp.
+  //  - Same-day rows are replaced, not appended, so a re-run (manual or retry)
+  //    can never leave duplicates — the day always ends up with exactly one
+  //    complete snapshot.
+  //  - If anything fails mid-load the transaction rolls back, so a partial
+  //    snapshot can never land (this is what silently truncated 7/11-7/13 loads).
+  //  - Multi-row parameterized INSERTs (under SQL Server's 2100-param limit)
+  //    cut ~4,000 round-trips down to ~40, so the load takes seconds.
+  const tx = new sql.Transaction(pool);
+  await tx.begin();
   let inserted = 0;
-  for (let i = 0; i < flat.length; i++) {
-    const rec = flat[i];
-    const req = pool.request();
-    const colList = [];
-    const valList = [];
-    cols.forEach((col, j) => {
-      const p = `p${j}`;
-      req.input(p, sql.NVarChar(sql.MAX), toText(rec[colMap.get(col)]));
-      colList.push(`[${col}]`);
-      valList.push(`@${p}`);
-    });
-    req.input('raw_payload', sql.NVarChar(sql.MAX), JSON.stringify(rows[i]));
-    colList.push('[raw_payload]');
-    valList.push('@raw_payload');
-    await req.query(`INSERT INTO dbo.${tableName} (${colList.join(',')}) VALUES (${valList.join(',')})`);
-    inserted++;
+  try {
+    const del = await new sql.Request(tx)
+      .query(`DELETE FROM dbo.${tableName} WHERE CAST(loaded_at AS date) = CAST(SYSUTCDATETIME() AS date)`);
+    const removed = del.rowsAffected && del.rowsAffected[0] ? del.rowsAffected[0] : 0;
+    if (removed) log(`Replaced ${removed} existing row(s) for today's snapshot in dbo.${tableName}.`);
+
+    const stampReq = await new sql.Request(tx).query('SELECT SYSUTCDATETIME() AS stamp');
+    const stamp = stampReq.recordset[0].stamp;
+
+    const paramsPerRow = cols.length + 2; // data cols + raw_payload + loaded_at
+    const rowsPerBatch = Math.max(1, Math.floor(2000 / paramsPerRow));
+    for (let start = 0; start < flat.length; start += rowsPerBatch) {
+      const slice = flat.slice(start, start + rowsPerBatch);
+      const req = new sql.Request(tx);
+      const valueGroups = [];
+      slice.forEach((rec, r) => {
+        const valList = [];
+        cols.forEach((col, j) => {
+          const p = `p${start + r}_${j}`;
+          req.input(p, sql.NVarChar(sql.MAX), toText(rec[colMap.get(col)]));
+          valList.push(`@${p}`);
+        });
+        const praw = `praw${start + r}`;
+        req.input(praw, sql.NVarChar(sql.MAX), JSON.stringify(rows[start + r]));
+        valList.push(`@${praw}`);
+        const pstamp = `pstamp${start + r}`;
+        req.input(pstamp, sql.DateTime2(0), stamp);
+        valList.push(`@${pstamp}`);
+        valueGroups.push(`(${valList.join(',')})`);
+      });
+      const colList = cols.map((c) => `[${c}]`).concat(['[raw_payload]', '[loaded_at]']);
+      await req.query(`INSERT INTO dbo.${tableName} (${colList.join(',')}) VALUES ${valueGroups.join(',')}`);
+      inserted += slice.length;
+    }
+
+    await tx.commit();
+  } catch (err) {
+    try { await tx.rollback(); } catch (_) { /* already rolled back */ }
+    throw err;
   }
-  log(`Inserted ${inserted} rows into dbo.${tableName} across ${cols.length} data columns (stamped loaded_at).`);
+  log(`Inserted ${inserted} rows into dbo.${tableName} across ${cols.length} data columns (single loaded_at stamp).`);
   return inserted;
 }
 
 async function runPull(log) {
   const creds = readCreds();
   const summary = [];
-  const pool = await sqlConnect();
+  const pool = await sqlConnect(log);
   try {
     for (const s of SEARCHES) {
       if (!s.searchID) { log(`Skipping ${s.tableName}: no searchID configured.`); continue; }
